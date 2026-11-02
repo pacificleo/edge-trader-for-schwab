@@ -51,6 +51,7 @@ _ALLOWED = frozenset({
 _TRADING = frozenset({"linked_accounts", "account_details", "account_orders", "quote", "quotes",
                       "order_details", "preview_order", "place_order", "cancel_order",
                       "replace_order"})   # replace: only Trader.move_stop (stop price of a live stop)
+_BACKEND_ALLOWED = _ALLOWED | _TRADING
 
 
 class AuthExpired(RuntimeError):
@@ -96,6 +97,11 @@ class ReadOnlyClient:
 def make_trading_client() -> ReadOnlyClient:
     """Separate client for the order ticket (preview + place only)."""
     return make_client(_TRADING)
+
+
+def make_backend_client() -> ReadOnlyClient:
+    """Client for BrokerBackend supporting both polling reads and trading actions."""
+    return make_client(_BACKEND_ALLOWED)
 
 
 def make_client(allowed: frozenset[str] = _ALLOWED) -> ReadOnlyClient:

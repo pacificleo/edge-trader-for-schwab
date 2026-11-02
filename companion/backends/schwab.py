@@ -498,7 +498,7 @@ class SchwabBackend(BrokerBackend):
 
     def connect(self) -> None:
         from .. import schwab
-        self.client = schwab.make_trading_client()
+        self.client = schwab.make_backend_client()
 
     def auth_status(self) -> str:
         from .. import schwab
@@ -579,7 +579,7 @@ class SchwabBackend(BrokerBackend):
         data = self._handle_response(resp)
         if isinstance(data, dict):
             orders = self._parse_orders([data])
-            return orders[0] if orders else None
+            return next((o for o in orders if o.order_id == order_id), orders[0] if orders else None)
         return None
 
     def get_fills(self, account_id: str, start: datetime, end: datetime) -> list[Fill]:

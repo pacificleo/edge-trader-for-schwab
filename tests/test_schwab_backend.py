@@ -2,8 +2,10 @@
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock
 import pytest
 
+from companion import schwab
 from companion.backends import (
     AccountBalances,
     AccountInfo,
@@ -19,6 +21,7 @@ from companion.backends import (
     get_backend,
 )
 from companion.backends.schwab import SchwabBackend
+from companion.schwab import _BACKEND_ALLOWED, ReadOnlyClient, make_backend_client
 
 
 # ---------------------------------------------------------------------------
@@ -638,3 +641,166 @@ def test_schwab_backend_broker_methods_with_client():
 
     close_id = backend.close_market("HASH123", "AAPL", "LONG", 100)
     assert close_id == 888001
+
+    details = backend.get_order_details("HASH123", 888001)
+    assert details is not None
+    assert details.order_id == 888001
+
+
+def test_make_backend_client_permissions(monkeypatch):
+    monkeypatch.setattr(schwab, "auth_hours_left", lambda: 100.0)
+    monkeypatch.setenv("SCHWAB_APP_KEY", "mock_key")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "mock_secret")
+
+    class MockInnerClient:
+        def __init__(self, *args, **kwargs):
+            self._session = MagicMock()
+            self.transactions = MagicMock()
+            self.market_hours = MagicMock()
+            self.linked_accounts = MagicMock()
+            self.place_order = MagicMock()
+            self.cancel_order = MagicMock()
+            self.replace_order = MagicMock()
+            self.streamer = MagicMock()
+
+    import schwabdev
+
+    monkeypatch.setattr(schwabdev, "Client", MockInnerClient)
+
+    client = make_backend_client()
+    assert isinstance(client, ReadOnlyClient)
+
+    # Allowed read methods
+    assert callable(client.transactions)
+    assert callable(client.market_hours)
+    assert callable(client.linked_accounts)
+
+    # Allowed trading methods
+    assert callable(client.place_order)
+    assert callable(client.cancel_order)
+    assert callable(client.replace_order)
+
+    # Strictly forbidden methods (e.g. streamer)
+    with pytest.raises(PermissionError) as exc_info:
+        _ = client.streamer
+    assert "streamer is not allowed on this client" in str(exc_info.value)
+
+
+def test_schwab_backend_with_backend_allowed_client_allows_fills_and_market_hours():
+    fake_client = FakeSchwabClient()
+    wrapped_backend_client = ReadOnlyClient(fake_client, _BACKEND_ALLOWED)
+    backend = SchwabBackend(auto_connect=False, client=wrapped_backend_client)
+
+    # Calling get_fills() calls client.transactions() which is permitted under _BACKEND_ALLOWED
+    fills = backend.get_fills("HASH123", datetime.now(timezone.utc), datetime.now(timezone.utc))
+    assert isinstance(fills, list)
+
+    # Calling get_market_hours() calls client.market_hours() which is permitted under _BACKEND_ALLOWED
+    mkt = backend.get_market_hours(date.today())
+    assert isinstance(mkt, MarketHours)
+    assert mkt.is_open is True
+
+    # For comparison: a client limited strictly to _TRADING would fail with PermissionError
+    trading_only_client = ReadOnlyClient(fake_client, schwab._TRADING)
+    bad_backend = SchwabBackend(auto_connect=False, client=trading_only_client)
+    with pytest.raises(PermissionError):
+        bad_backend.get_fills("HASH123", datetime.now(timezone.utc), datetime.now(timezone.utc))
+    with pytest.raises(PermissionError):
+        bad_backend.get_market_hours(date.today())
+
+
+def test_schwab_backend_get_order_details_multi_leg_matching():
+    tree = {
+        "orderId": 1001,
+        "orderStrategyType": "TRIGGER",
+        "orderType": "LIMIT",
+        "price": 150.0,
+        "quantity": 100,
+        "status": "FILLED",
+        "orderLegCollection": [
+            {
+                "legId": 1,
+                "instruction": "BUY",
+                "positionEffect": "OPENING",
+                "quantity": 100,
+                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+            }
+        ],
+        "childOrderStrategies": [
+            {
+                "orderId": 1002,
+                "orderStrategyType": "OCO",
+                "status": "WORKING",
+                "childOrderStrategies": [
+                    {
+                        "orderId": 1003,
+                        "orderStrategyType": "SINGLE",
+                        "orderType": "LIMIT",
+                        "price": 160.0,
+                        "quantity": 100,
+                        "status": "WORKING",
+                        "orderLegCollection": [
+                            {
+                                "legId": 1,
+                                "instruction": "SELL",
+                                "quantity": 100,
+                                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+                            }
+                        ],
+                    },
+                    {
+                        "orderId": 1004,
+                        "orderStrategyType": "SINGLE",
+                        "orderType": "STOP",
+                        "stopPrice": 145.0,
+                        "quantity": 100,
+                        "status": "WORKING",
+                        "orderLegCollection": [
+                            {
+                                "legId": 1,
+                                "instruction": "SELL",
+                                "quantity": 100,
+                                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+    class MultiLegClient(FakeSchwabClient):
+        def order_details(self, hash_val: str, order_id: int):
+            return FakeResponse(200, tree)
+
+    client = MultiLegClient()
+    backend = SchwabBackend(auto_connect=False, client=client)
+
+    # 1. Fetching details for the STOP leg (1004) returns leg 1004, not the root 1001
+    stop_order = backend.get_order_details("HASH123", 1004)
+    assert stop_order is not None
+    assert stop_order.order_id == 1004
+    assert stop_order.order_type == "STOP"
+    assert stop_order.stop == 145.0
+    assert stop_order.role == "STOP"
+
+    # 2. Fetching details for the TARGET leg (1003) returns leg 1003
+    target_order = backend.get_order_details("HASH123", 1003)
+    assert target_order is not None
+    assert target_order.order_id == 1003
+    assert target_order.order_type == "LIMIT"
+    assert target_order.price == 160.0
+    assert target_order.role == "TARGET"
+
+    # 3. Fetching details for the ENTRY leg (1001) returns leg 1001
+    entry_order = backend.get_order_details("HASH123", 1001)
+    assert entry_order is not None
+    assert entry_order.order_id == 1001
+    assert entry_order.order_type == "LIMIT"
+    assert entry_order.price == 150.0
+    assert entry_order.role == "ENTRY"
+
+    # 4. Fallback when order_id is not in the tree returns orders[0]
+    fallback_order = backend.get_order_details("HASH123", 9999)
+    assert fallback_order is not None
+    assert fallback_order.order_id == 1001
