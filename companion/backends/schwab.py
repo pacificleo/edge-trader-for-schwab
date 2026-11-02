@@ -168,6 +168,11 @@ class SchwabBackend(BrokerBackend):
         if auto_connect and self.client is None:
             self.connect()
 
+    def __getattr__(self, name: str) -> Any:
+        if self.client is not None and hasattr(self.client, name):
+            return getattr(self.client, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     # -----------------------------------------------------------------------
     # Cooldown & Rate Limiting
     # -----------------------------------------------------------------------

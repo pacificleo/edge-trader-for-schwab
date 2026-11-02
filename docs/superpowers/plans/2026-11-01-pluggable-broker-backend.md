@@ -257,7 +257,7 @@ Inject `backend: BrokerBackend` into `Poller`. Replace direct client calls with 
 Run: `.venv/bin/python -m pytest tests/test_auto_be.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add companion/poller.py tests/test_auto_be.py
 git commit -m "refactor(poller): decouple poller from schwab client using BrokerBackend"
@@ -275,21 +275,21 @@ git commit -m "refactor(poller): decouple poller from schwab client using Broker
 - Consumes: `backend: BrokerBackend`.
 - Produces: `Trader(backend: BrokerBackend, store: Store)`. Replaces `FakeClient` with `MockBackend(BrokerBackend)` in tests.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Update `tests/test_trading.py` to use a `MockBackend(BrokerBackend)` fixture.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `.venv/bin/python -m pytest tests/test_trading.py -k test_places_exactly_the_displayed_bracket -v`
 Expected: FAIL due to signature or missing backend integration.
 
-- [ ] **Step 3: Refactor `companion/trading.py`**
+- [x] **Step 3: Refactor `companion/trading.py`**
 Inject `backend: BrokerBackend` into `Trader`. Replace `_ensure()`, client order placement/cancellation/replacement with `self.backend` calls.
 
-- [ ] **Step 4: Run tests to verify all trading tests pass**
+- [x] **Step 4: Run tests to verify all trading tests pass**
 Run: `.venv/bin/python -m pytest tests/test_trading.py -v`
 Expected: PASS (all tests pass against `MockBackend`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add companion/trading.py tests/test_trading.py
 git commit -m "refactor(trading): decouple Trader from schwab client using BrokerBackend"

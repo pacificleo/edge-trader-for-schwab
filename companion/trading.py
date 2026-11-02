@@ -22,8 +22,19 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import schwab
-from .bracket import MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick
+from .backends import (
+    AccountBalances,
+    AccountInfo,
+    BracketOrder,
+    BrokerBackend,
+    Fill,
+    MarketHours,
+    PendingOrder,
+    Position,
+    Quote,
+    get_backend,
+)
+from .bracket import MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick, to_bracket_order
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
@@ -156,23 +167,36 @@ class Trader:
     on_request = None                  # set by the poller: counts order traffic in its limiter
     cooldown_left = None               # set by the poller: seconds left of a 429 pause
     _waited_for = 0.0                  # the 429 pause this trader already waited on
-    def __init__(self, store: Store):
-        self.store = store
-        self._client = None
+    def __init__(self, backend: BrokerBackend | None = None, store: Store | None = None):
+        if isinstance(backend, Store) and store is None:
+            store = backend
+            backend = None
+        self.store = store or Store()
+        if backend is None:
+            backend = get_backend("schwab", auto_connect=False)
+        self.backend = backend
+        self._connected = False
         self._hash: str | None = None
         self._send_lock = threading.Lock()
         self._quote_cache: dict[str, tuple[float, dict]] = {}
 
+    @property
+    def _client(self):
+        return self.backend
+
+    @_client.setter
+    def _client(self, val):
+        self.backend = val
+
     # ---- plumbing ----------------------------------------------------------
 
     def _ensure(self):
-        if self._client is not None and self.expected_hash and self._hash != self.expected_hash:
+        if self._hash is not None and self.expected_hash and self._hash != self.expected_hash:
             raise RuntimeError("the dashboard switched accounts: restart the companion before trading")
-        if self._client is None:
-            client = schwab.make_trading_client()
-            r = client.linked_accounts()
-            r.raise_for_status()
-            hashes = [a.get("hashValue") for a in r.json()]
+        if not self._connected or self._hash is None:
+            self.backend.connect()
+            accounts = self.backend.get_accounts()
+            hashes = [a.hash_value for a in accounts]
             if self.expected_hash:
                 if self.expected_hash not in hashes:
                     raise RuntimeError("the account shown on the dashboard is not linked to this login")
@@ -181,8 +205,8 @@ class Trader:
                 if len(hashes) != 1:
                     raise RuntimeError("several linked accounts and the dashboard has not picked one yet")
                 self._hash = hashes[0]
-            self._client = client
-        return self._client
+            self._connected = True
+        return self.backend
 
     @property
     def armed(self) -> bool:
@@ -232,11 +256,14 @@ class Trader:
         except Exception as e:
             self.store.log_request(endpoint, started, False, None, repr(e)[:300])
             raise
-        if r.status_code == 429 and self.on_request:
-            self.on_request(r.headers.get("Retry-After") or "30")
-        ok = r.status_code in (200, 201)
-        detail = None if ok else (f"Retry-After={r.headers.get('Retry-After')} " + r.text[:250])
-        self.store.log_request(endpoint, started, ok, r.status_code, detail)
+        if hasattr(r, "status_code"):
+            if r.status_code == 429 and self.on_request:
+                self.on_request(r.headers.get("Retry-After") or "30")
+            ok = r.status_code in (200, 201)
+            detail = None if ok else (f"Retry-After={r.headers.get('Retry-After')} " + getattr(r, "text", "")[:250])
+            self.store.log_request(endpoint, started, ok, r.status_code, detail)
+        else:
+            self.store.log_request(endpoint, started, True, 200, None)
         return r
 
     def quote(self, symbol: str, max_age: float = 1.0) -> dict:
@@ -244,14 +271,37 @@ class Trader:
         hit = self._quote_cache.get(sym)
         if hit and time.monotonic() - hit[0] < max_age:
             return hit[1]
-        r = self._logged("ticket_quote", lambda: self._ensure().quotes([sym]))
-        r.raise_for_status()
-        entry = (r.json() or {}).get(sym) or {}
-        q, ref = entry.get("quote") or {}, entry.get("reference") or {}
-        out = {"symbol": sym, "found": bool(q), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
-               "last": q.get("lastPrice"), "change_pct": q.get("netPercentChange"),
-               "name": ref.get("description"), "exchange": ref.get("exchangeName"),
-               "asset_type": entry.get("assetMainType")}
+        self._ensure()
+        if hasattr(self.backend, "get_quotes"):
+            r = self._logged("ticket_quote", lambda: self.backend.get_quotes([sym]))
+        else:
+            r = self._logged("ticket_quote", lambda: self.backend.quotes([sym]))
+        if isinstance(r, _Throttled):
+            r.raise_for_status()
+        out = None
+        if isinstance(r, dict):
+            val = r.get(sym)
+            if isinstance(val, Quote):
+                out = {"symbol": sym, "found": True, "bid": val.bid, "ask": val.ask,
+                       "last": val.last, "change_pct": val.change_pct,
+                       "name": sym, "exchange": None, "asset_type": "EQUITY"}
+            elif isinstance(val, dict):
+                q = val.get("quote") or val
+                ref = val.get("reference") or {}
+                out = {"symbol": sym, "found": bool(q), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
+                       "last": q.get("lastPrice"), "change_pct": q.get("netPercentChange"),
+                       "name": ref.get("description"), "exchange": ref.get("exchangeName"),
+                       "asset_type": val.get("assetMainType")}
+        elif hasattr(r, "json"):
+            entry = (r.json() or {}).get(sym) or {}
+            q, ref = entry.get("quote") or {}, entry.get("reference") or {}
+            out = {"symbol": sym, "found": bool(q), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
+                   "last": q.get("lastPrice"), "change_pct": q.get("netPercentChange"),
+                   "name": ref.get("description"), "exchange": ref.get("exchangeName"),
+                   "asset_type": entry.get("assetMainType")}
+        if out is None:
+            out = {"symbol": sym, "found": False, "bid": None, "ask": None, "last": None,
+                   "change_pct": None, "name": None, "exchange": None, "asset_type": None}
         self._quote_cache[sym] = (time.monotonic(), out)
         return out
 
@@ -271,12 +321,20 @@ class Trader:
         out = {"plan": p.as_dict()}
         if not p.ok:
             return out
+        bo = to_bracket_order(p)
         order = bracket_order(p)
         out["order"] = order
+        self._ensure()
         try:
-            r = self._logged("preview_order", lambda: self._ensure().preview_order(self._hash, order))
-            body = r.json() if r.content and "json" in r.headers.get("Content-Type", "") else r.text[:2000]
-            out["schwab_preview"] = {"http": r.status_code, "body": _mask_account(body)}
+            if hasattr(self.backend, "preview_bracket"):
+                r = self._logged("preview_order", lambda: self.backend.preview_bracket(self._hash, bo))
+            else:
+                r = self._logged("preview_order", lambda: self.backend.preview_order(self._hash, order))
+            if hasattr(r, "status_code"):
+                body = r.json() if r.content and "json" in r.headers.get("Content-Type", "") else r.text[:2000]
+                out["schwab_preview"] = {"http": r.status_code, "body": _mask_account(body)}
+            else:
+                out["schwab_preview"] = {"http": 200, "body": _mask_account(r)}
         except Exception as e:
             out["schwab_preview"] = {"error": repr(e)[:300]}
         return out
@@ -410,6 +468,7 @@ class Trader:
         elif req.get("expected_trail_offset"):
             return {"ok": False, "error": "Ticket showed a trailing stop but the plan has a fixed one. Review.",
                     "plan": p.as_dict()}
+        bo = to_bracket_order(p)
         order = bracket_order(p)
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
                   "limit": fmt(p.limit), "stop": fmt(p.stop), "target": fmt(p.target),
@@ -421,39 +480,68 @@ class Trader:
         log.warning("PLACE %s %s %s @ %s stop %s target %s", p.side, p.qty, p.symbol, p.limit,
                     p.stop, p.target)
         state["sent"] = True
+        self._ensure()
         try:
-            r = self._logged("place_order", lambda: self._ensure().place_order(self._hash, order))
+            if hasattr(self.backend, "place_bracket"):
+                r = self._logged("place_order", lambda: self.backend.place_bracket(self._hash, bo))
+            else:
+                r = self._logged("place_order", lambda: self.backend.place_order(self._hash, order))
         except Exception as e:   # timeout, connection reset: the order may or may not exist
+            err_msg = str(e)
+            if "429" in err_msg or "rate limit" in err_msg.lower():
+                self._safe_update(ticket_id, "RATE_LIMITED", detail=err_msg)
+                return {"ok": False, "status": "RATE_LIMITED", "ticket_id": ticket_id,
+                        "error": "Schwab throttled the order request (HTTP 429): nothing was placed. Click again to retry."}
+            if "rejected" in err_msg.lower() or "400" in err_msg:
+                self._safe_update(ticket_id, "REJECTED", detail=err_msg)
+                return {"ok": False, "status": "REJECTED", "ticket_id": ticket_id,
+                        "error": f"Schwab rejected the order: {err_msg[:300]}"}
             self._safe_update(ticket_id, "UNKNOWN", detail=repr(e)[:500])
             return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
                     "error": "No answer from Schwab. The order MAY be live: check thinkorswim."}
-        if r.status_code in (200, 201):
-            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-            oid = int(tail) if tail.isdigit() else None
-            status = "ACCEPTED" if oid else "ACCEPTED_UNTRACKED"
+        if r is None:
+            raise RuntimeError("no response from broker after placing order")
+        if isinstance(r, int) and r > 0:
+            oid = r
+            status = "ACCEPTED"
             if not self._safe_update(ticket_id, status, order_id=oid):
-                # The ticket stays SENDING (which blocks new tickets) until reconciled.
                 return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id, "order_id": oid,
                         "error": "Schwab accepted the order but the companion could not record it. "
                                  "Check thinkorswim."}
             return {"ok": True, "status": status, "order_id": oid, "ticket_id": ticket_id,
                     "plan": p.as_dict()}
-        if r.status_code == 429:
-            # Throttled before Schwab looked at the order: nothing was placed, a retry is safe
-            # (it gets a new ticket id, so the record of this attempt stays intact).
-            ra = r.headers.get("Retry-After")
-            self._safe_update(ticket_id, "RATE_LIMITED", detail=f"Retry-After={ra} {r.text[:800]}")
-            return {"ok": False, "status": "RATE_LIMITED", "ticket_id": ticket_id, "retry_after": ra,
-                    "error": "Schwab throttled the order request (HTTP 429): nothing was placed. "
-                             + (f"Retry in {ra} s." if ra else "Click again to retry.")}
-        if 400 <= r.status_code < 500:
-            # Schwab refused it: nothing was placed.
-            self._safe_update(ticket_id, "REJECTED", detail=r.text[:1000])
-            return {"ok": False, "status": "REJECTED", "ticket_id": ticket_id,
-                    "error": f"Schwab rejected the order (HTTP {r.status_code}): {r.text[:300]}"}
-        self._safe_update(ticket_id, "UNKNOWN", detail=f"HTTP {r.status_code}: {r.text[:500]}")
-        return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
-                "error": f"Schwab answered HTTP {r.status_code}. The order MAY be live: check thinkorswim."}
+        if hasattr(r, "status_code"):
+            if r.status_code in (200, 201):
+                tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+                oid = int(tail) if tail.isdigit() else None
+                status = "ACCEPTED" if oid else "ACCEPTED_UNTRACKED"
+                if not self._safe_update(ticket_id, status, order_id=oid):
+                    # The ticket stays SENDING (which blocks new tickets) until reconciled.
+                    return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id, "order_id": oid,
+                            "error": "Schwab accepted the order but the companion could not record it. "
+                                     "Check thinkorswim."}
+                return {"ok": True, "status": status, "order_id": oid, "ticket_id": ticket_id,
+                        "plan": p.as_dict()}
+            if r.status_code == 429:
+                # Throttled before Schwab looked at the order: nothing was placed, a retry is safe
+                # (it gets a new ticket id, so the record of this attempt stays intact).
+                ra = r.headers.get("Retry-After")
+                self._safe_update(ticket_id, "RATE_LIMITED", detail=f"Retry-After={ra} {r.text[:800]}")
+                return {"ok": False, "status": "RATE_LIMITED", "ticket_id": ticket_id, "retry_after": ra,
+                        "error": "Schwab throttled the order request (HTTP 429): nothing was placed. "
+                                 + (f"Retry in {ra} s." if ra else "Click again to retry.")}
+            if 400 <= r.status_code < 500:
+                # Schwab refused it: nothing was placed.
+                self._safe_update(ticket_id, "REJECTED", detail=r.text[:1000])
+                return {"ok": False, "status": "REJECTED", "ticket_id": ticket_id,
+                        "error": f"Schwab rejected the order (HTTP {r.status_code}): {r.text[:300]}"}
+            self._safe_update(ticket_id, "UNKNOWN", detail=f"HTTP {r.status_code}: {r.text[:500]}")
+            return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
+                    "error": f"Schwab answered HTTP {r.status_code}. The order MAY be live: check thinkorswim."}
+        status = "ACCEPTED_UNTRACKED"
+        self._safe_update(ticket_id, status, order_id=None)
+        return {"ok": True, "status": status, "order_id": None, "ticket_id": ticket_id,
+                "plan": p.as_dict()}
 
     # ---- cancel unfilled entries -------------------------------------------
 
@@ -487,11 +575,16 @@ class Trader:
             self.store.log_action("cancel_entry", sym, order_id, "UNKNOWN", repr(e))
             return {"ok": False, "order_id": order_id, "symbol": sym,
                     "error": "No answer from Schwab: the entry may or may not be cancelled. Check thinkorswim."}
-        if r.status_code not in (200, 201, 204):
-            # Typical: it filled a moment before the cancel arrived.
-            self.store.log_action("cancel_entry", sym, order_id, "REJECTED", f"HTTP {r.status_code} {r.text[:300]}")
+        if hasattr(r, "status_code"):
+            if r.status_code not in (200, 201, 204):
+                # Typical: it filled a moment before the cancel arrived.
+                self.store.log_action("cancel_entry", sym, order_id, "REJECTED", f"HTTP {r.status_code} {getattr(r, 'text', '')[:300]}")
+                return {"ok": False, "order_id": order_id, "symbol": sym,
+                        "error": f"Schwab refused the cancel (HTTP {r.status_code}). It may have filled: check positions."}
+        elif r is False:
+            self.store.log_action("cancel_entry", sym, order_id, "REJECTED", "Cancel refused")
             return {"ok": False, "order_id": order_id, "symbol": sym,
-                    "error": f"Schwab refused the cancel (HTTP {r.status_code}). It may have filled: check positions."}
+                    "error": "Schwab refused the cancel. It may have filled: check positions."}
         # Confirm: only CANCELED with zero fills counts as done. Up to ~3 s of read-only checks.
         status, filled, final = "UNCONFIRMED", None, {}
         for _ in range(10):
@@ -751,27 +844,36 @@ class Trader:
         self.store.log_action("close", symbol, None, "SENDING", f"{instr} {size:g} MARKET")
         log.warning("CLOSE %s %s %s MARKET", instr, size, symbol)
         try:
-            r = self._logged("place_order", lambda: client.place_order(self._hash, order))
+            if hasattr(client, "close_market") and asset == "EQUITY":
+                side_str = "LONG" if qty > 0 else "SHORT"
+                r = self._logged("place_order", lambda: client.close_market(self._hash, symbol, side_str, size))
+            else:
+                r = self._logged("place_order", lambda: client.place_order(self._hash, order))
         except Exception as e:
             self.store.log_action("close", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "symbol": symbol, "unresolved_close": True,
                     "error": "No answer from Schwab on the close. It MAY have been sent (and your stop/target "
                              "cancelled by Schwab): check thinkorswim now."}
-        if r.status_code == 429:
-            self.store.log_action("close", symbol, None, "RATE_LIMITED", r.text[:300])
-            return {"ok": False, "symbol": symbol,
-                    "error": "Schwab throttled the close (HTTP 429): nothing was sent. Your stop/target are still working."}
-        if r.status_code >= 500:
-            self.store.log_action("close", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:300]}")
-            return {"ok": False, "symbol": symbol, "unresolved_close": True,
-                    "error": f"Schwab answered HTTP {r.status_code}: the close MAY have been sent. Check thinkorswim now."}
-        if r.status_code not in (200, 201):
-            self.store.log_action("close", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:300]}")
-            return {"ok": False, "symbol": symbol,
-                    "error": f"Schwab refused the close (HTTP {r.status_code}): {r.text[:200]}. "
-                             "Your stop/target should still be working: check thinkorswim."}
-        tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-        oid = int(tail) if tail.isdigit() else None
+        if isinstance(r, int) and r > 0:
+            oid = r
+        elif hasattr(r, "status_code"):
+            if r.status_code == 429:
+                self.store.log_action("close", symbol, None, "RATE_LIMITED", r.text[:300])
+                return {"ok": False, "symbol": symbol,
+                        "error": "Schwab throttled the close (HTTP 429): nothing was sent. Your stop/target are still working."}
+            if r.status_code >= 500:
+                self.store.log_action("close", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:300]}")
+                return {"ok": False, "symbol": symbol, "unresolved_close": True,
+                        "error": f"Schwab answered HTTP {r.status_code}: the close MAY have been sent. Check thinkorswim now."}
+            if r.status_code not in (200, 201):
+                self.store.log_action("close", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:300]}")
+                return {"ok": False, "symbol": symbol,
+                        "error": f"Schwab refused the close (HTTP {r.status_code}): {r.text[:200]}. "
+                                 "Your stop/target should still be working: check thinkorswim."}
+            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+            oid = int(tail) if tail.isdigit() else None
+        else:
+            oid = None
         final: dict = {}
         if oid:
             for _ in range(10):   # a market order usually fills well within a second
@@ -923,18 +1025,26 @@ class Trader:
             self.store.log_action("move_stop", symbol, p.order_id, "SENDING",
                                   f"{fmt(Decimal(str(cur.get('stopPrice') or 0)))} -> {fmt(price)}")
             try:
-                rr = self._logged("replace_order", lambda o=p.order_id, b=body: client.replace_order(self._hash, o, b))
+                if hasattr(client, "replace_stop"):
+                    rr = self._logged("replace_order", lambda o=p.order_id, pr=float(price): client.replace_stop(self._hash, o, pr))
+                else:
+                    rr = self._logged("replace_order", lambda o=p.order_id, b=body: client.replace_order(self._hash, o, b))
             except Exception as e:
                 self.store.log_action("move_stop", symbol, p.order_id, "UNKNOWN", repr(e))
                 results.append({"order_id": p.order_id, "ok": False, "note": "no answer from Schwab"})
                 continue
-            if rr.status_code not in (200, 201):
-                self.store.log_action("move_stop", symbol, p.order_id, "REJECTED", f"HTTP {rr.status_code} {rr.text[:200]}")
-                results.append({"order_id": p.order_id, "ok": False,
-                                 "note": f"Schwab refused (HTTP {rr.status_code}): {rr.text[:150]}"})
-                continue
-            tail = rr.headers.get("Location", "").rstrip("/").split("/")[-1]
-            results.append({"order_id": p.order_id, "ok": True, "new_id": int(tail) if tail.isdigit() else None})
+            if isinstance(rr, int) and rr > 0:
+                results.append({"order_id": p.order_id, "ok": True, "new_id": rr})
+            elif hasattr(rr, "status_code"):
+                if rr.status_code not in (200, 201):
+                    self.store.log_action("move_stop", symbol, p.order_id, "REJECTED", f"HTTP {rr.status_code} {rr.text[:200]}")
+                    results.append({"order_id": p.order_id, "ok": False,
+                                     "note": f"Schwab refused (HTTP {rr.status_code}): {rr.text[:150]}"})
+                    continue
+                tail = rr.headers.get("Location", "").rstrip("/").split("/")[-1]
+                results.append({"order_id": p.order_id, "ok": True, "new_id": int(tail) if tail.isdigit() else None})
+            else:
+                results.append({"order_id": p.order_id, "ok": True, "new_id": None})
         # Verify: each new stop working at the new price, and the OCO's target still working.
         time.sleep(0.6)
         after = self._fresh_orders(client)

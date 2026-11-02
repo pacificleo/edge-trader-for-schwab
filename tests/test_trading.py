@@ -1,9 +1,22 @@
-"""Order ticket service with a fake Schwab client: nothing here talks to Schwab."""
+"""Order ticket service with a fake broker backend: nothing here talks to Schwab."""
+from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
 
 from companion import trading
+from companion.backends import (
+    AccountBalances,
+    AccountInfo,
+    BracketOrder,
+    BrokerBackend,
+    BrokerCapabilities,
+    Fill,
+    MarketHours,
+    PendingOrder,
+    Position,
+    Quote,
+)
 from companion.store import Store
 from companion.trading import Trader
 
@@ -17,9 +30,125 @@ class Resp:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-class FakeClient:
+class MockBackend(BrokerBackend):
     def __init__(self, resp=None, exc=None):
+        self.capabilities = BrokerCapabilities(name="mock")
         self.placed, self.resp, self.exc = [], resp or Resp(201, {"Location": ".../orders/555"}), exc
+        self._connected = True
+        self.cancelled = []
+        self.orders = {}
+        self.replaced = []
+
+    def connect(self) -> None:
+        self._connected = True
+
+    def auth_status(self) -> str:
+        return "live"
+
+    def auth_hours_left(self) -> float | None:
+        return 24.0
+
+    def login_cli(self, reauth: bool = False) -> None:
+        pass
+
+    def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        return {
+            s: Quote(symbol=s, bid=338.70, ask=338.77, last=338.75, mark=338.75, volume=1000.0)
+            for s in symbols
+        }
+
+    def get_market_hours(self, d: date) -> MarketHours:
+        return MarketHours(date=d, is_open=True)
+
+    def get_accounts(self) -> list[AccountInfo]:
+        return [AccountInfo(account_id="H" * 64, hash_value="H" * 64, display_name="Mock Account")]
+
+    def get_positions(self, account_id: str) -> list[Position]:
+        return []
+
+    def get_balances(self, account_id: str) -> AccountBalances:
+        return AccountBalances(liquidation_value=100_000.0)
+
+    def get_orders(self, account_id: str, start: datetime, end: datetime, status: str | None = None) -> list[PendingOrder]:
+        return []
+
+    def get_order_details(self, account_id: str, order_id: int) -> PendingOrder | None:
+        return None
+
+    def get_fills(self, account_id: str, start: datetime, end: datetime) -> list[Fill]:
+        return []
+
+    def preview_bracket(self, account_id: str, bracket: BracketOrder) -> dict:
+        return {}
+
+    def place_bracket(self, account_id: str, bracket: BracketOrder) -> int:
+        from companion.backends.schwab import SchwabBackend
+        order = SchwabBackend()._build_schwab_order(bracket)
+        r = self.place_order(account_id, order)
+        if self.exc:
+            raise self.exc
+        if r is None:
+            return None
+        if hasattr(r, "status_code"):
+            if r.status_code in (200, 201):
+                tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+                return int(tail) if tail.isdigit() else 555
+            return r
+        return 555
+
+    def cancel_order(self, account_id: str, order_id: int) -> bool:
+        self.cancelled.append(order_id)
+        return True
+
+    def replace_stop(self, account_id: str, order_id: int, new_stop: float) -> int:
+        cur_resp = self.order_details(account_id, order_id)
+        cur = cur_resp.json() if hasattr(cur_resp, "json") else cur_resp
+        legs = cur.get("orderLegCollection") or []
+        body = {
+            "orderStrategyType": "SINGLE",
+            "orderType": cur.get("orderType", "STOP"),
+            "session": cur.get("session", "NORMAL"),
+            "duration": cur.get("duration", "DAY"),
+            "stopPrice": f"{new_stop:.2f}" if new_stop >= 1 else f"{new_stop:.4f}",
+            "orderLegCollection": legs,
+        }
+        if cur.get("orderType") == "STOP_LIMIT" and cur.get("price") is not None:
+            body["price"] = cur.get("price")
+        r = self.replace_order(account_id, order_id, body)
+        if hasattr(r, "headers"):
+            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+            if tail.isdigit():
+                return int(tail)
+        return order_id
+
+    def replace_with_trail(self, account_id: str, order_id: int, trail_spec: dict) -> int:
+        return order_id
+
+    def replace_target(self, account_id: str, order_id: int, new_target: float) -> int:
+        return order_id
+
+    def close_market(self, account_id: str, symbol: str, side: str, qty: float) -> int:
+        instr = "SELL" if side.upper() == "LONG" else "BUY_TO_COVER"
+        size = abs(qty)
+        order = {
+            "orderStrategyType": "SINGLE",
+            "orderType": "MARKET",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderLegCollection": [
+                {
+                    "instruction": instr,
+                    "quantity": int(size) if size.is_integer() else size,
+                    "instrument": {"symbol": symbol, "assetType": "EQUITY"},
+                }
+            ],
+        }
+        r = self.place_order(account_id, order)
+        if hasattr(r, "headers"):
+            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+            if tail.isdigit():
+                return int(tail)
+        return 0
 
     def place_order(self, _hash, order):
         self.placed.append(order)
@@ -28,10 +157,14 @@ class FakeClient:
         return self.resp
 
 
+FakeClient = MockBackend
+
+
 @pytest.fixture
 def trader(tmp_path, monkeypatch):
-    t = Trader(Store(tmp_path / "t.db"))
-    t._client, t._hash = FakeClient(), "H" * 64
+    backend = MockBackend()
+    t = Trader(backend=backend, store=Store(tmp_path / "t.db"))
+    t._hash = "H" * 64
     monkeypatch.setattr(trading, "market_open", lambda now=None: True)
     monkeypatch.setattr(t, "quote", lambda sym, max_age=1.0: {"bid": 338.70, "ask": 338.77})
     t.arm(True)
@@ -941,15 +1074,19 @@ def test_partial_protects_only_what_is_surely_left(trader, monkeypatch):
 
 
 def test_trading_client_uses_the_dashboard_account(trader, monkeypatch):
-    class Accts:
-        def linked_accounts(self):
-            return JsonResp(200, [{"hashValue": "A"}, {"hashValue": "B"}])
-    monkeypatch.setattr(trading.schwab, "make_trading_client", lambda: Accts())
-    trader._client = None
+    class AcctsBackend(MockBackend):
+        def get_accounts(self):
+            return [AccountInfo("1", "A", "A"), AccountInfo("2", "B", "B")]
+
+    trader.backend = AcctsBackend()
+    trader._connected = False
+    trader._hash = None
     trader.expected_hash = "B"
     trader._ensure()
     assert trader._hash == "B"
-    trader._client, trader.expected_hash = None, None
+    trader._connected = False
+    trader._hash = None
+    trader.expected_hash = None
     with pytest.raises(RuntimeError):
         trader._ensure()                                        # two accounts, none picked
 
@@ -1024,3 +1161,11 @@ def test_partial_at_bid_and_ask_uses_the_literal_price(trader, monkeypatch):
     trader._client = Broker([_mu_oco()], fill_limits=True)
     trader.take_partial("MXR", 0.5, None, [], set(), mode="ask")
     assert trader._client.placed[0]["price"] == "906.30"             # cover at the ask: takes
+
+
+def test_trading_module_has_no_schwab_imports():
+    import inspect
+    import companion.trading as tm
+    source = inspect.getsource(tm)
+    assert "from . import schwab" not in source
+    assert "import schwab" not in source
