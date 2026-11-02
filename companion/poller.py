@@ -66,48 +66,71 @@ def _retry_after(value: str | None) -> float:
             return 30.0
 
 
+def _orders_to_dicts(orders: list[PendingOrder | dict]) -> list[dict]:
+    by_id: dict[int, list[PendingOrder]] = {}
+    dicts: list[dict] = []
+    for o in orders:
+        if isinstance(o, dict):
+            dicts.append(o)
+        elif isinstance(o, PendingOrder):
+            by_id.setdefault(o.order_id, []).append(o)
+
+    for oid, legs in by_id.items():
+        sorted_legs = sorted(legs, key=lambda l: l.leg_id)
+        first = sorted_legs[0]
+        dicts.append({
+            "orderId": first.order_id,
+            "status": first.status,
+            "orderType": first.order_type,
+            "quantity": first.qty,
+            "remainingQuantity": first.qty,
+            "filledQuantity": first.filled,
+            "price": first.price,
+            "stopPrice": first.stop,
+            "duration": first.duration,
+            "enteredTime": first.entered,
+            "tag": first.tag,
+            "orderStrategyType": first.group_type,
+            "orderLegCollection": [
+                {
+                    "legId": l.leg_id,
+                    "instruction": l.instruction,
+                    "positionEffect": l.effect,
+                    "quantity": l.qty,
+                    "instrument": {
+                        "symbol": l.symbol,
+                        "underlyingSymbol": l.underlying,
+                        "assetType": l.asset_type,
+                    },
+                }
+                for l in sorted_legs
+            ],
+            "stopPriceOffset": first.trail_offset,
+            "stopPriceLinkType": first.trail_link,
+            "stopPriceLinkBasis": first.trail_basis,
+        })
+    return dicts
+
+
 def _order_to_dict(p: PendingOrder) -> dict:
-    return {
-        "orderId": p.order_id,
-        "status": p.status,
-        "orderType": p.order_type,
-        "quantity": p.qty,
-        "remainingQuantity": p.qty,
-        "filledQuantity": p.filled,
-        "price": p.price,
-        "stopPrice": p.stop,
-        "duration": p.duration,
-        "enteredTime": p.entered,
-        "tag": p.tag,
-        "orderStrategyType": p.group_type,
-        "orderLegCollection": [
-            {
-                "legId": p.leg_id,
-                "instruction": p.instruction,
-                "positionEffect": p.effect,
-                "quantity": p.qty,
-                "instrument": {
-                    "symbol": p.symbol,
-                    "underlyingSymbol": p.underlying,
-                    "assetType": p.asset_type,
-                },
-            }
-        ],
-        "stopPriceOffset": p.trail_offset,
-        "stopPriceLinkType": p.trail_link,
-        "stopPriceLinkBasis": p.trail_basis,
-    }
+    return _orders_to_dicts([p])[0]
 
 
-def _fill_to_transaction(f: Fill) -> dict:
-    act_id = f.id.split(":")[0] if ":" in f.id else f.id
-    return {
-        "activityId": act_id,
-        "type": "TRADE",
-        "status": "VALID",
-        "orderId": f.order_id,
-        "time": f.time.isoformat() if hasattr(f.time, "isoformat") else str(f.time),
-        "transferItems": [
+def _fills_to_transactions(fills: list[Fill | dict]) -> list[dict]:
+    by_activity: dict[str, list[Fill]] = {}
+    txns: list[dict] = []
+    for f in fills:
+        if isinstance(f, dict):
+            txns.append(f)
+        elif isinstance(f, Fill):
+            act_id = f.id.split(":")[0] if ":" in f.id else f.id
+            by_activity.setdefault(act_id, []).append(f)
+
+    for act_id, group in by_activity.items():
+        sorted_fills = sorted(group, key=lambda x: x.id)
+        first = sorted_fills[0]
+        total_fees = sum(f.fees for f in sorted_fills if f.fees)
+        items = [
             {
                 "instrument": {
                     "symbol": f.symbol,
@@ -118,13 +141,28 @@ def _fill_to_transaction(f: Fill) -> dict:
                 "price": f.price,
                 "cost": abs(f.qty * f.price * f.multiplier),
                 "positionEffect": f.effect,
-            },
-            {
+            }
+            for f in sorted_fills
+        ]
+        if total_fees != 0.0:
+            items.append({
                 "instrument": {"assetType": "CURRENCY"},
-                "cost": f.fees,
-            },
-        ],
-    }
+                "cost": total_fees,
+            })
+        act_val = int(act_id) if str(act_id).isdigit() else act_id
+        txns.append({
+            "activityId": act_val,
+            "type": "TRADE",
+            "status": "VALID",
+            "orderId": first.order_id,
+            "time": first.time.isoformat() if hasattr(first.time, "isoformat") else str(first.time),
+            "transferItems": items,
+        })
+    return txns
+
+
+def _fill_to_transaction(f: Fill) -> dict:
+    return _fills_to_transactions([f])[0]
 
 
 def _quote_to_dict(q: Quote) -> dict:
@@ -319,7 +357,7 @@ class Poller:
         if len(data) >= TXN_CAP and end - start > timedelta(hours=1):
             mid = start + (end - start) / 2
             return self._fetch_transactions(name, start, mid) and self._fetch_transactions(name, mid, end)
-        txns = [_fill_to_transaction(f) if isinstance(f, Fill) else f for f in data]
+        txns = _fills_to_transactions(data)
         self.store.save_transactions(txns)
         return True
 
@@ -394,7 +432,7 @@ class Poller:
             data = self._call(name, lambda: self.backend.get_orders(target_account, self._session_start_utc(), now))
             if not isinstance(data, list):
                 return False
-            order_dicts = [_order_to_dict(o) if isinstance(o, PendingOrder) else o for o in data]
+            order_dicts = _orders_to_dicts(data)
             self.store.save_orders(order_dicts)
             self.terminal |= terminal_ids(order_dicts)
             self.orders_today = {o["orderId"]: o for o in order_dicts}
@@ -405,7 +443,7 @@ class Poller:
                     target_account, now - timedelta(days=ORDER_SWEEP_DAYS), now, status=st))
                 if not isinstance(data, list):
                     return False
-                order_dicts = [_order_to_dict(o) if isinstance(o, PendingOrder) else o for o in data]
+                order_dicts = _orders_to_dicts(data)
                 found.update({o["orderId"]: o for o in order_dicts})
             self.store.save_orders(list(found.values()))
             self.terminal |= terminal_ids(list(found.values()))
@@ -448,14 +486,15 @@ class Poller:
             self.followed_at[oid] = time.monotonic()
             data = self._call("order_details", lambda o=oid: self.backend.get_order_details(target_account, o))
             if data is not None:
-                order_dict = _order_to_dict(data) if isinstance(data, PendingOrder) else data
-                if isinstance(order_dict, dict) and order_dict.get("orderId"):
-                    self.store.save_orders([order_dict])
-                    self.terminal |= terminal_ids([order_dict])
-                    if order_dict.get("status") not in TERMINAL:
-                        self.orders_followed[oid] = order_dict
-                    else:
-                        self.orders_followed.pop(oid, None)
+                dicts = _orders_to_dicts([data] if isinstance(data, PendingOrder) else (data if isinstance(data, list) else [data]))
+                for order_dict in dicts:
+                    if isinstance(order_dict, dict) and order_dict.get("orderId"):
+                        self.store.save_orders([order_dict])
+                        self.terminal |= terminal_ids([order_dict])
+                        if order_dict.get("status") not in TERMINAL:
+                            self.orders_followed[oid] = order_dict
+                        else:
+                            self.orders_followed.pop(oid, None)
 
     def _record_prev_session(self, data: dict) -> None:
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()

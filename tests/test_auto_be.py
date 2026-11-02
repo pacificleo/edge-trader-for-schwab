@@ -247,10 +247,103 @@ def test_poller_follow_order_calls_backend_order_details(tmp_path):
     store = Store(tmp_path / "p.db")
     p = Poller(backend=backend, store=store)
     assert p._connect() is True
+    terminal_order = PendingOrder(
+        order_id=999, leg_id=1, legs=1, group_id=999, group_type="SINGLE",
+        parent_id=None, oco_id=None, status="FILLED", symbol="AAPL",
+        underlying="AAPL", asset_type="EQUITY", instruction="BUY",
+        effect="OPENING", order_type="LIMIT", qty=100.0, filled=100.0,
+        price=150.0, stop=None, duration="DAY", entered="2026-11-02T09:30:00Z",
+        tag=None, role="ENTRY"
+    )
+    backend.get_order_details = lambda acct, oid: (backend.calls.append(("get_order_details", acct, oid)) or terminal_order)
+    p.orders_followed[999] = {"orderId": 999, "status": "WORKING"}
     p._follow([999])
     details_calls = [c for c in backend.calls if c[0] == "get_order_details"]
     assert len(details_calls) == 1
     assert details_calls[0][2] == 999
+    assert 999 in p.terminal
+    assert 999 not in p.orders_followed
+    saved = store.all_orders()
+    assert any(o.get("orderId") == 999 and o.get("status") == "FILLED" for o in saved)
+
+
+def test_poller_multileg_orders_retain_all_legs_in_today_and_sweep(tmp_path):
+    backend = MockBackend()
+    store = Store(tmp_path / "p.db")
+    p = Poller(backend=backend, store=store)
+    assert p._connect() is True
+
+    leg1 = PendingOrder(
+        order_id=501, leg_id=1, legs=2, group_id=501, group_type="SPREAD",
+        parent_id=None, oco_id=None, status="WORKING", symbol="SPY_C500",
+        underlying="SPY", asset_type="OPTION", instruction="BUY_TO_OPEN",
+        effect="OPENING", order_type="NET_DEBIT", qty=10.0, filled=0.0,
+        price=2.50, stop=None, duration="DAY", entered="2026-11-02T10:00:00Z",
+        tag=None, role="ENTRY"
+    )
+    leg2 = PendingOrder(
+        order_id=501, leg_id=2, legs=2, group_id=501, group_type="SPREAD",
+        parent_id=None, oco_id=None, status="WORKING", symbol="SPY_C505",
+        underlying="SPY", asset_type="OPTION", instruction="SELL_TO_OPEN",
+        effect="OPENING", order_type="NET_DEBIT", qty=10.0, filled=0.0,
+        price=2.50, stop=None, duration="DAY", entered="2026-11-02T10:00:00Z",
+        tag=None, role="ENTRY"
+    )
+    backend.get_orders = lambda acct, start, end, status=None: [leg1, leg2]
+
+    # Test orders_today
+    assert p._poll("orders_today") is True
+    assert 501 in p.orders_today
+    legs_today = p.orders_today[501]["orderLegCollection"]
+    assert len(legs_today) == 2
+    assert legs_today[0]["legId"] == 1 and legs_today[0]["instrument"]["symbol"] == "SPY_C500"
+    assert legs_today[1]["legId"] == 2 and legs_today[1]["instrument"]["symbol"] == "SPY_C505"
+
+    # Test orders_sweep
+    assert p._poll("orders_sweep") is True
+    assert 501 in p.orders_sweep
+    legs_sweep = p.orders_sweep[501]["orderLegCollection"]
+    assert len(legs_sweep) == 2
+    assert legs_sweep[0]["legId"] == 1 and legs_sweep[0]["instrument"]["symbol"] == "SPY_C500"
+    assert legs_sweep[1]["legId"] == 2 and legs_sweep[1]["instrument"]["symbol"] == "SPY_C505"
+
+
+def test_poller_multifill_transactions_do_not_overwrite_in_sqlite(tmp_path):
+    from datetime import timezone
+    from companion.pnl import fills_from_transactions
+    backend = MockBackend()
+    store = Store(tmp_path / "p.db")
+    p = Poller(backend=backend, store=store)
+    assert p._connect() is True
+
+    now_dt = datetime(2026, 11, 2, 10, 5, tzinfo=timezone.utc)
+    f1 = Fill(
+        id="777123:0", order_id=501, time=now_dt,
+        symbol="SPY_C500", asset_type="OPTION", underlying="SPY",
+        qty=10.0, price=5.0, multiplier=100.0, fees=-1.50, effect="OPENING"
+    )
+    f2 = Fill(
+        id="777123:1", order_id=501, time=now_dt,
+        symbol="SPY_C505", asset_type="OPTION", underlying="SPY",
+        qty=-10.0, price=2.5, multiplier=100.0, fees=0.0, effect="OPENING"
+    )
+    backend.get_fills = lambda acct, start, end: [f1, f2]
+
+    assert p._poll("transactions") is True
+
+    # Verify in SQLite store
+    txns = store.transactions_since("2026-11-02T00:00:00")
+    assert len(txns) == 1
+    assert txns[0]["activityId"] == 777123
+    # Both fill items are present in transferItems
+    non_currency_items = [it for it in txns[0]["transferItems"] if (it.get("instrument") or {}).get("assetType") != "CURRENCY"]
+    assert len(non_currency_items) == 2
+
+    # Reconstructed fills from transaction must yield both fills
+    reconstructed = fills_from_transactions(txns)
+    assert len(reconstructed) == 2
+    symbols = {f.symbol for f in reconstructed}
+    assert symbols == {"SPY_C500", "SPY_C505"}
 
 
 def test_poller_backfill_calls_get_fills(tmp_path):

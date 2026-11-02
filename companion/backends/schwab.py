@@ -92,7 +92,7 @@ def _walk_orders(
 ) -> None:
     status = o.get("status", "?")
     legs = o.get("orderLegCollection") or []
-    if legs and status not in TERMINAL_STATUSES:
+    if legs:
         order_qty = float(o.get("quantity") or 0.0)
         remaining = float(o.get("remainingQuantity")) if o.get("remainingQuantity") is not None else order_qty
         order_type = o.get("orderType", "?")
@@ -366,8 +366,9 @@ class SchwabBackend(BrokerBackend):
             _walk_orders(o, o.get("orderId", 0), o.get("orderStrategyType", "SINGLE"), None, out)
         deduped: dict[tuple[int, int], PendingOrder] = {}
         for p in out:
-            if p.order_id not in done:
-                deduped[(p.order_id, p.leg_id)] = p
+            if p.order_id in done and p.status not in TERMINAL_STATUSES:
+                continue
+            deduped[(p.order_id, p.leg_id)] = p
         return sorted(
             deduped.values(),
             key=lambda p: (p.underlying, p.group_id, p.role, p.order_id, p.leg_id),

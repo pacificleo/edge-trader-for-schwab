@@ -362,6 +362,49 @@ def test_parse_orders():
     assert stop.oco_id == 102
 
 
+def test_parse_orders_preserves_terminal_orders_and_discards_frozen_working():
+    backend = SchwabBackend(auto_connect=False)
+    # Scenario: order 201 has a frozen WORKING copy and an inner FILLED copy
+    # Order 202 is pure CANCELED
+    orders_data = [
+        {
+            "orderId": 201,
+            "status": "WORKING",  # Frozen copy in sweep
+            "quantity": 50,
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [{"legId": 1, "instruction": "BUY", "instrument": {"symbol": "MSFT"}}],
+        },
+        {
+            "orderId": 200,
+            "status": "WORKING",
+            "orderStrategyType": "OCO",
+            "childOrderStrategies": [
+                {
+                    "orderId": 201,
+                    "status": "FILLED",  # Real terminal state
+                    "quantity": 50,
+                    "orderStrategyType": "SINGLE",
+                    "orderLegCollection": [{"legId": 1, "instruction": "BUY", "instrument": {"symbol": "MSFT"}}],
+                }
+            ],
+        },
+        {
+            "orderId": 202,
+            "status": "CANCELED",  # Terminal standalone order
+            "quantity": 25,
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [{"legId": 1, "instruction": "SELL", "instrument": {"symbol": "TSLA"}}],
+        },
+    ]
+    parsed = backend._parse_orders(orders_data)
+    # Order 201 should be present with status FILLED (not working, not discarded)
+    o201 = next(o for o in parsed if o.order_id == 201)
+    assert o201.status == "FILLED"
+    # Order 202 should be present with status CANCELED
+    o202 = next(o for o in parsed if o.order_id == 202)
+    assert o202.status == "CANCELED"
+
+
 def test_parse_fills():
     backend = SchwabBackend(auto_connect=False)
     txns_data = [
