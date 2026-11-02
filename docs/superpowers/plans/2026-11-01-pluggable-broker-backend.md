@@ -309,21 +309,21 @@ git commit -m "refactor(trading): decouple Trader from schwab client using Broke
 - Consumes: `--broker <name>` from CLI or `EDGE_TRADER_BROKER` env var.
 - Produces: Backend instantiation via `get_backend(broker_name)`, database path `data/db_<broker>.db` (or `data/demo.db` if `--demo`), and wiring into `poller` and `trader`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Add a test in `tests/test_backends.py` for database path resolution and CLI flag parsing.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `.venv/bin/python -m pytest tests/test_backends.py -k test_cli_broker_selection -v`
 Expected: FAIL
 
-- [ ] **Step 3: Implement `--broker` wiring in `__main__.py`, `app.py`, and `login.py`**
+- [x] **Step 3: Implement `--broker` wiring in `__main__.py`, `app.py`, and `login.py`**
 Parse `--broker` (defaulting to `"schwab"`), configure database name, instantiate backend, wire into FastAPI app.
 
-- [ ] **Step 4: Run all tests to verify full integration passes**
+- [x] **Step 4: Run all tests to verify full integration passes**
 Run: `.venv/bin/python -m pytest -v`
 Expected: PASS (all tests pass cleanly).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add companion/__main__.py companion/app.py companion/login.py tests/test_backends.py
 git commit -m "feat(cli): wire --broker flag and isolated database path selection"
@@ -341,14 +341,14 @@ git commit -m "feat(cli): wire --broker flag and isolated database path selectio
 - Consumes: All completed tasks and passing tests.
 - Produces: Fully updated documentation detailing `--broker`, the `BrokerBackend` interface, and how developers can plug in new brokers.
 
-- [ ] **Step 1: Run the full test suite**
+- [x] **Step 1: Run the full test suite**
 Run: `.venv/bin/python -m pytest -v`
 Expected: 125+ tests pass with zero errors.
 
-- [ ] **Step 2: Update `AGENTS.md` and `DEV.md`**
+- [x] **Step 2: Update `AGENTS.md` and `DEV.md`**
 Document the `companion/backends/` package, `BrokerBackend` interface, and the `--broker` CLI argument.
 
-- [ ] **Step 3: Commit documentation updates**
+- [x] **Step 3: Commit documentation updates**
 ```bash
 git add AGENTS.md DEV.md
 git commit -m "docs: document pluggable broker backend interface and --broker CLI option"
