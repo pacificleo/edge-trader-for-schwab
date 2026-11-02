@@ -24,6 +24,11 @@ def register_backend(name: str, cls: type[BrokerBackend]) -> None:
     _REGISTRY[name.lower()] = cls
 
 
+from .schwab import SchwabBackend
+
+register_backend("schwab", SchwabBackend)
+
+
 def get_backend(name: str, **kwargs: Any) -> BrokerBackend:
     """Instantiate and return a registered BrokerBackend.
 

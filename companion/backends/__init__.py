@@ -15,6 +15,7 @@ from .base import (
     TargetSpec,
 )
 from .registry import get_backend, register_backend
+from .schwab import SchwabBackend
 
 __all__ = [
     "AccountBalances",
@@ -27,6 +28,7 @@ __all__ = [
     "PendingOrder",
     "Position",
     "Quote",
+    "SchwabBackend",
     "StopSpec",
     "TargetSpec",
     "get_backend",
