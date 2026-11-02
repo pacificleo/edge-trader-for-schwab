@@ -27,7 +27,15 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from . import schwab
+from .backends import (
+    BrokerBackend,
+    Fill,
+    MarketHours,
+    PendingOrder,
+    Position,
+    Quote,
+    get_backend,
+)
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
@@ -58,10 +66,99 @@ def _retry_after(value: str | None) -> float:
             return 30.0
 
 
+def _order_to_dict(p: PendingOrder) -> dict:
+    return {
+        "orderId": p.order_id,
+        "status": p.status,
+        "orderType": p.order_type,
+        "quantity": p.qty,
+        "remainingQuantity": p.qty,
+        "filledQuantity": p.filled,
+        "price": p.price,
+        "stopPrice": p.stop,
+        "duration": p.duration,
+        "enteredTime": p.entered,
+        "tag": p.tag,
+        "orderStrategyType": p.group_type,
+        "orderLegCollection": [
+            {
+                "legId": p.leg_id,
+                "instruction": p.instruction,
+                "positionEffect": p.effect,
+                "quantity": p.qty,
+                "instrument": {
+                    "symbol": p.symbol,
+                    "underlyingSymbol": p.underlying,
+                    "assetType": p.asset_type,
+                },
+            }
+        ],
+        "stopPriceOffset": p.trail_offset,
+        "stopPriceLinkType": p.trail_link,
+        "stopPriceLinkBasis": p.trail_basis,
+    }
+
+
+def _fill_to_transaction(f: Fill) -> dict:
+    act_id = f.id.split(":")[0] if ":" in f.id else f.id
+    return {
+        "activityId": act_id,
+        "type": "TRADE",
+        "status": "VALID",
+        "orderId": f.order_id,
+        "time": f.time.isoformat() if hasattr(f.time, "isoformat") else str(f.time),
+        "transferItems": [
+            {
+                "instrument": {
+                    "symbol": f.symbol,
+                    "assetType": f.asset_type,
+                    "underlyingSymbol": f.underlying,
+                },
+                "amount": f.qty,
+                "price": f.price,
+                "cost": abs(f.qty * f.price * f.multiplier),
+                "positionEffect": f.effect,
+            },
+            {
+                "instrument": {"assetType": "CURRENCY"},
+                "cost": f.fees,
+            },
+        ],
+    }
+
+
+def _quote_to_dict(q: Quote) -> dict:
+    qt_ms = int(q.quote_time.timestamp() * 1000) if q.quote_time else int(time.time() * 1000)
+    return {
+        "realtime": True,
+        "quote": {
+            "symbol": q.symbol,
+            "bidPrice": q.bid,
+            "askPrice": q.ask,
+            "lastPrice": q.last,
+            "mark": q.mark,
+            "totalVolume": q.volume,
+            "netPercentChange": q.change_pct,
+            "quoteTime": qt_ms,
+        },
+    }
+
+
 class Poller:
-    def __init__(self, store: Store | None = None):
+    def __init__(self, backend: BrokerBackend | None = None, store: Store | None = None):
+        if isinstance(backend, Store) and store is None:
+            store = backend
+            backend = None
         self.store = store or Store()
-        self.client = None
+        if backend is None:
+            backend = get_backend("schwab", auto_connect=False)
+        self.backend = backend
+        self.rate_limit_per_min = (
+            self.backend.capabilities.rate_limit_per_min
+            if self.backend and self.backend.capabilities
+            else MAX_PER_MIN
+        )
+        self.account_id: str | None = None
         self.account_hash: str | None = None
         self.account: dict | None = None
         self.orders_today: dict[int, dict] = {}
@@ -70,7 +167,7 @@ class Poller:
         self.followed_at: dict[int, float] = {}      # when each followed order was last asked
         self.quotes: dict = {}
         self.trail_best: dict[int, float] = {}   # trailing stop order id -> best price seen
-        self.hours: dict = {}       # today's and the next regular session (Schwab, holidays and early closes)
+        self.hours: dict = {}       # today's and the next regular session (holidays and early closes)
         self.trader = None   # set by the app; the poller never sends orders (Auto B/E hands its one move to it)
         # Every order id ever seen finished. Schwab's WORKING sweep can return a frozen
         # stand-alone copy of an order that actually filled inside an OCO.
@@ -85,9 +182,19 @@ class Poller:
         self._next = {k: 0.0 for k in INTERVALS}
         self._sent: deque[float] = deque()
         self._cooldown_until = 0.0
+        self._connected = False
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+
+    @property
+    def client(self):
+        return getattr(self.backend, "client", None)
+
+    @client.setter
+    def client(self, val):
+        if hasattr(self.backend, "client"):
+            self.backend.client = val
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -107,13 +214,20 @@ class Poller:
     # ---- requests --------------------------------------------------------
 
     def _throttle(self) -> None:
-        """Block until a request fits under MAX_PER_MIN and any 429 cooldown is over."""
+        """Block until a request fits under rate_limit_per_min and any 429 cooldown is over."""
         while not self._stop.is_set():
             now = time.monotonic()
             while self._sent and now - self._sent[0] > 60:
                 self._sent.popleft()
+            rate_limit = (
+                self.backend.capabilities.rate_limit_per_min
+                if self.backend and self.backend.capabilities
+                else self.rate_limit_per_min
+            )
+            backend_cd = getattr(self.backend, "cooldown_until", 0.0)
             wait = max(self._cooldown_until - now,
-                       (self._sent[0] + 60 - now) if len(self._sent) >= MAX_PER_MIN else 0)
+                       backend_cd - now,
+                       (self._sent[0] + 60 - now) if len(self._sent) >= rate_limit else 0)
             if wait <= 0:
                 self._sent.append(now)
                 return
@@ -125,31 +239,44 @@ class Poller:
         self._sent.append(time.monotonic())
         if retry_after is not None:
             self._cooldown_until = time.monotonic() + _retry_after(str(retry_after))
+        elif hasattr(self.backend, "cooldown_until") and self.backend.cooldown_until > time.monotonic():
+            self._cooldown_until = self.backend.cooldown_until
 
     def cooldown_left(self) -> float:
-        return max(0.0, self._cooldown_until - time.monotonic())
+        backend_cd = getattr(self.backend, "cooldown_until", 0.0)
+        return max(0.0, self._cooldown_until - time.monotonic(), backend_cd - time.monotonic())
 
     def _call(self, name: str, fn):
-        """One HTTP request. Returns parsed JSON, or None on any failure (never raises)."""
+        """One HTTP/backend request. Returns parsed result, or None on any failure (never raises)."""
         self._throttle()
         started = now_iso()
         fr = self.fresh.setdefault(name, {"ok_at": None, "error": None, "interval": None})
         try:
-            r = fn()
-            if r.status_code == 429:
-                wait = _retry_after(r.headers.get("Retry-After"))
-                self._cooldown_until = time.monotonic() + wait
-                fr["error"] = f"rate limited, all requests paused {wait:.0f}s"
-                self.store.log_request(name, started, False, 429, r.text[:300])
-                return None
-            if r.status_code != 200:
-                fr["error"] = f"HTTP {r.status_code}"
-                self.store.log_request(name, started, False, r.status_code, r.text[:300])
-                return None
-            data = r.json() if r.content else None
+            data = fn()
+            if hasattr(data, "status_code"):
+                if data.status_code == 429:
+                    wait = _retry_after(data.headers.get("Retry-After") if hasattr(data, "headers") else None)
+                    self._cooldown_until = time.monotonic() + wait
+                    fr["error"] = f"rate limited, all requests paused {wait:.0f}s"
+                    self.store.log_request(name, started, False, 429, getattr(data, "text", "")[:300])
+                    return None
+                if data.status_code != 200:
+                    fr["error"] = f"HTTP {data.status_code}"
+                    self.store.log_request(name, started, False, data.status_code, getattr(data, "text", "")[:300])
+                    return None
+                data = data.json() if getattr(data, "content", None) else None
         except Exception as e:  # network, auth, permission, bad JSON
-            fr["error"] = repr(e)[:200]
-            self.store.log_request(name, started, False, None, repr(e)[:300])
+            err_msg = repr(e)[:200]
+            fr["error"] = err_msg
+            if "429" in err_msg or "Rate limited" in err_msg:
+                if hasattr(self.backend, "cooldown_until") and self.backend.cooldown_until > time.monotonic():
+                    self._cooldown_until = self.backend.cooldown_until
+                else:
+                    self._cooldown_until = time.monotonic() + 30.0
+                fr["error"] = f"rate limited, all requests paused {self.cooldown_left():.0f}s"
+                self.store.log_request(name, started, False, 429, repr(e)[:300])
+            else:
+                self.store.log_request(name, started, False, None, repr(e)[:300])
             log.warning("%s failed: %r", name, e)
             return None
         self.store.log_request(name, started, True, 200, None)
@@ -162,32 +289,38 @@ class Poller:
 
     def _connect(self) -> bool:
         try:
-            client = schwab.make_client()
+            self.backend.connect()
         except Exception as e:
             self.status = f"auth: {e}"
             return False
-        self.client = client
-        accts = self._call("account", lambda: client.linked_accounts())
+        accts = self._call("account", lambda: self.backend.get_accounts())
         if isinstance(accts, list) and len(accts) > 1:
             log.warning("%d linked accounts: the companion uses the first one", len(accts))
-        if not accts or not isinstance(accts, list) or "hashValue" not in accts[0]:
-            self.client = None   # retry discovery next time; never poll without an account
+        if not accts or not isinstance(accts, list):
             self.status = "could not list linked accounts"
             return False
-        self.account_hash = accts[0]["hashValue"]
+        first = accts[0]
+        self.account_id = getattr(first, "account_id", None) or (first.get("accountNumber") if isinstance(first, dict) else None)
+        self.account_hash = getattr(first, "hash_value", None) or (first.get("hashValue") if isinstance(first, dict) else None) or self.account_id
+        if not self.account_hash and not self.account_id:
+            self.status = "could not list linked accounts"
+            return False
+        self._connected = True
         if self.trader is not None:
             self.trader.expected_hash = self.account_hash      # orders only to the account shown
         return True
 
     def _fetch_transactions(self, name: str, start: datetime, end: datetime) -> bool:
         """Store all TRADE transactions in [start, end); halve a range that hits the cap."""
-        data = self._call(name, lambda: self.client.transactions(self.account_hash, start, end, "TRADE"))
+        target_account = self.account_hash or self.account_id
+        data = self._call(name, lambda: self.backend.get_fills(target_account, start, end))
         if data is None or not isinstance(data, list):
             return False
         if len(data) >= TXN_CAP and end - start > timedelta(hours=1):
             mid = start + (end - start) / 2
             return self._fetch_transactions(name, start, mid) and self._fetch_transactions(name, mid, end)
-        self.store.save_transactions(data)
+        txns = [_fill_to_transaction(f) if isinstance(f, Fill) else f for f in data]
+        self.store.save_transactions(txns)
         return True
 
     def _backfill(self) -> bool:
@@ -208,30 +341,72 @@ class Poller:
         return (et_midnight - timedelta(hours=6)).astimezone(timezone.utc)
 
     def _poll(self, name: str) -> bool:
-        h = self.account_hash
+        target_account = self.account_hash or self.account_id
         now = datetime.now(timezone.utc)
         if name == "account":
-            data = self._call(name, lambda: self.client.account_details(h, fields="positions"))
-            if not isinstance(data, dict) or "securitiesAccount" not in data:
+            positions = self._call(name, lambda: self.backend.get_positions(target_account))
+            balances = self._call(name, lambda: self.backend.get_balances(target_account))
+            if positions is None or balances is None:
                 return False
+            if isinstance(positions, dict):
+                data = positions
+            else:
+                pos_list = []
+                for p in positions:
+                    if isinstance(p, Position):
+                        pos_list.append({
+                            "instrument": {
+                                "symbol": p.symbol,
+                                "assetType": p.asset_type,
+                                "underlyingSymbol": p.underlying,
+                            },
+                            "longQuantity": p.qty if p.side == "LONG" else 0.0,
+                            "shortQuantity": p.qty if p.side == "SHORT" else 0.0,
+                            "averagePrice": p.avg_price,
+                            "marketValue": p.market_value,
+                            "longOpenProfitLoss": p.open_pnl if p.side == "LONG" else 0.0,
+                            "shortOpenProfitLoss": p.open_pnl if p.side == "SHORT" else 0.0,
+                            "currentDayProfitLoss": p.day_pnl,
+                            "previousSessionLongQuantity": p.previous_session_qty if p.side == "LONG" else 0.0,
+                            "previousSessionShortQuantity": p.previous_session_qty if p.side == "SHORT" else 0.0,
+                            "currentDayCost": 0.0 if p.held == "CARRIED" else 1.0,
+                        })
+                    elif isinstance(p, dict):
+                        pos_list.append(p)
+                bal_dict = {
+                    "liquidationValue": getattr(balances, "liquidation_value", None),
+                    "equity": getattr(balances, "equity", None),
+                    "buyingPower": getattr(balances, "buying_power", None),
+                    "dayTradingBuyingPower": getattr(balances, "day_trading_buying_power", None),
+                    "availableFunds": getattr(balances, "available_funds", None),
+                    "maintenanceRequirement": getattr(balances, "maintenance_requirement", None),
+                } if not isinstance(balances, dict) else balances
+                data = {
+                    "securitiesAccount": {
+                        "positions": pos_list,
+                        "currentBalances": bal_dict,
+                    }
+                }
             self.account = data
             self.store.save_positions(data)
             self._record_prev_session(data)
         elif name == "orders_today":
-            data = self._call(name, lambda: self.client.account_orders(h, self._session_start_utc(), now))
+            data = self._call(name, lambda: self.backend.get_orders(target_account, self._session_start_utc(), now))
             if not isinstance(data, list):
                 return False
-            self.store.save_orders(data)
-            self.terminal |= terminal_ids(data)
-            self.orders_today = {o["orderId"]: o for o in data}
+            order_dicts = [_order_to_dict(o) if isinstance(o, PendingOrder) else o for o in data]
+            self.store.save_orders(order_dicts)
+            self.terminal |= terminal_ids(order_dicts)
+            self.orders_today = {o["orderId"]: o for o in order_dicts}
         elif name == "orders_sweep":
             found: dict[int, dict] = {}
             for status in SWEEP_STATUSES:
-                data = self._call(name, lambda st=status: self.client.account_orders(
-                    h, now - timedelta(days=ORDER_SWEEP_DAYS), now, status=st))
+                data = self._call(name, lambda st=status: self.backend.get_orders(
+                    target_account, now - timedelta(days=ORDER_SWEEP_DAYS), now, status=st))
                 if not isinstance(data, list):
                     return False
-                found.update({o["orderId"]: o for o in data})
+                order_dicts = [_order_to_dict(o) if isinstance(o, PendingOrder) else o for o in data]
+                found.update({o["orderId"]: o for o in order_dicts})
             self.store.save_orders(list(found.values()))
             self.terminal |= terminal_ids(list(found.values()))
             vanished = [oid for oid in self.orders_sweep
@@ -254,26 +429,33 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if syms:
-                data = self._call(name, lambda: self.client.quotes(syms))
+                data = self._call(name, lambda: self.backend.get_quotes(syms))
                 if not isinstance(data, dict):
                     return False
-                self.quotes = data
-                self.store.save_quotes({k: v for k, v in data.items() if isinstance(v, dict)})
+                quotes_dict = {
+                    k: _quote_to_dict(v) if isinstance(v, Quote) else v
+                    for k, v in data.items()
+                }
+                self.quotes = quotes_dict
+                self.store.save_quotes({k: v for k, v in quotes_dict.items() if isinstance(v, dict)})
         self._ok(name)
         return True
 
     def _follow(self, order_ids: list[int]) -> None:
         """Orders that left the working set: fetch their final state once."""
+        target_account = self.account_hash or self.account_id
         for oid in order_ids:
             self.followed_at[oid] = time.monotonic()
-            data = self._call("order_details", lambda o=oid: self.client.order_details(self.account_hash, o))
-            if isinstance(data, dict) and data.get("orderId"):
-                self.store.save_orders([data])
-                self.terminal |= terminal_ids([data])
-                if data.get("status") not in TERMINAL:
-                    self.orders_followed[oid] = data
-                else:
-                    self.orders_followed.pop(oid, None)
+            data = self._call("order_details", lambda o=oid: self.backend.get_order_details(target_account, o))
+            if data is not None:
+                order_dict = _order_to_dict(data) if isinstance(data, PendingOrder) else data
+                if isinstance(order_dict, dict) and order_dict.get("orderId"):
+                    self.store.save_orders([order_dict])
+                    self.terminal |= terminal_ids([order_dict])
+                    if order_dict.get("status") not in TERMINAL:
+                        self.orders_followed[oid] = order_dict
+                    else:
+                        self.orders_followed.pop(oid, None)
 
     def _record_prev_session(self, data: dict) -> None:
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
@@ -328,17 +510,35 @@ class Poller:
         out: dict = {"today": None, "next": None}
         for i in range(7):
             d = today + timedelta(days=i)
-            data = self._call(name, lambda d=d: self.client.market_hours(["equity"], date=d.isoformat()))
-            if not isinstance(data, dict):
+            mh = self._call(name, lambda d=d: self.backend.get_market_hours(d))
+            if mh is None:
                 return False
-            eq = next(iter((data.get("equity") or {}).values()), {})
-            reg = (eq.get("sessionHours") or {}).get("regularMarket") or []
-            sess = {"date": d.isoformat(), "open": reg[0]["start"], "close": reg[-1]["end"]}                 if eq.get("isOpen") and reg else None
+            if isinstance(mh, MarketHours):
+                sess = {
+                    "date": d.isoformat(),
+                    "open": mh.open_time.isoformat() if mh.open_time else None,
+                    "close": mh.close_time.isoformat() if mh.close_time else None,
+                } if (mh.is_open and mh.open_time and mh.close_time) else None
+            elif isinstance(mh, dict):
+                eq = next(iter((mh.get("equity") or {}).values()), {})
+                reg = (eq.get("sessionHours") or {}).get("regularMarket") or []
+                sess = {"date": d.isoformat(), "open": reg[0]["start"], "close": reg[-1]["end"]} \
+                    if eq.get("isOpen") and reg else None
+            else:
+                sess = None
+
             if i == 0:
                 out["today"] = sess
-            if sess and datetime.fromisoformat(sess["close"]) > now:
-                out["next"] = sess
-                break
+            if sess and sess.get("close"):
+                try:
+                    close_dt = datetime.fromisoformat(sess["close"])
+                    if close_dt.tzinfo is None:
+                        close_dt = close_dt.replace(tzinfo=timezone.utc)
+                    if close_dt > now:
+                        out["next"] = sess
+                        break
+                except ValueError:
+                    pass
         self.hours = out
         return True
 
@@ -351,11 +551,12 @@ class Poller:
         since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         txns = self.store.transactions_since(since)
+        left = self.backend.auth_hours_left() if self.backend else None
         st = build_state(account=self.account, orders=self._merged_orders(),
                          txns=txns, quotes=self.quotes,
                          prev_session=self.store.load_prev_session(day),
                          freshness=self.fresh, history_complete=self.history_complete,
-                         orders_fresh=self._orders_fresh(), auth_hours_left=schwab.auth_hours_left(),
+                         orders_fresh=self._orders_fresh(), auth_hours_left=left,
                          known_terminal=self.terminal)
         self.last_rebuild = now_iso()
         st["status"] = self.status
@@ -516,7 +717,7 @@ class Poller:
         backfill_next = 0.0
         while not self._stop.is_set():
             try:
-                if self.client is None:
+                if not self._connected:
                     if not self._connect():
                         self._publish_status()
                         self._stop.wait(30)
@@ -529,11 +730,12 @@ class Poller:
                     backfill_next = time.monotonic() + 60
                 self.status = "live" if self.history_complete else "live, fill history incomplete"
 
-                left = schwab.auth_hours_left()
-                if left is None or left < schwab.SAFETY_HOURS:
+                auth_st = self.backend.auth_status() if self.backend else "live"
+                if auth_st in ("needs_login", "expired"):
                     # Keep serving cached data, clearly stale; never trigger an interactive login.
-                    self.status = "Schwab login expiring: run login.bat (python -m companion.login)"
-                    self.client = None
+                    broker_name = getattr(getattr(self.backend, "capabilities", None), "name", "broker").capitalize()
+                    self.status = f"{broker_name} login expiring: run login.bat (python -m companion.login)"
+                    self._connected = False
                     self._publish_status()
                     self._stop.wait(60)
                     continue
@@ -565,7 +767,7 @@ class Poller:
         with self._lock:
             st = dict(self.state)
             st["status"] = self.status
-            st["auth_hours_left"] = schwab.auth_hours_left()
+            st["auth_hours_left"] = self.backend.auth_hours_left() if self.backend else None
             st["freshness"] = self.fresh
             st["last_rebuild"] = self.last_rebuild
             self.state = st

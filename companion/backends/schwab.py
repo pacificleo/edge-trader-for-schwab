@@ -162,7 +162,7 @@ class SchwabBackend(BrokerBackend):
         has_market_hours_api=True,
     )
 
-    def __init__(self, auto_connect: bool = True, client: Any = None):
+    def __init__(self, auto_connect: bool = False, client: Any = None):
         self.client = client
         self._cooldown_until: float = 0.0
         if auto_connect and self.client is None:
@@ -364,7 +364,14 @@ class SchwabBackend(BrokerBackend):
         out: list[PendingOrder] = []
         for o in orders_data:
             _walk_orders(o, o.get("orderId", 0), o.get("orderStrategyType", "SINGLE"), None, out)
-        return [p for p in out if p.order_id not in done]
+        deduped: dict[tuple[int, int], PendingOrder] = {}
+        for p in out:
+            if p.order_id not in done:
+                deduped[(p.order_id, p.leg_id)] = p
+        return sorted(
+            deduped.values(),
+            key=lambda p: (p.underlying, p.group_id, p.role, p.order_id, p.leg_id),
+        )
 
     def _parse_fills(self, txns_data: list[dict]) -> list[Fill]:
         if not txns_data:
@@ -420,7 +427,14 @@ class SchwabBackend(BrokerBackend):
                     )
                 )
 
-        return sorted(out, key=lambda f: (f.time, f.id))
+        def _seq(fill_id: str) -> tuple[int, int]:
+            parts = fill_id.split(":")
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except (ValueError, IndexError):
+                return (0, 0)
+
+        return sorted(out, key=lambda f: (f.time, _seq(f.id)))
 
     def _parse_quotes(self, quotes_data: dict) -> dict[str, Quote]:
         out: dict[str, Quote] = {}

@@ -115,7 +115,7 @@ git commit -m "feat(backend): add BrokerBackend interface and registry"
 - Produces: `to_bracket_order(p: Plan, duration: str = "DAY") -> BracketOrder`.
   (Also keep `bracket_order(p)` as a helper returning `to_bracket_order(p)` or adapter for backwards compatibility during transition).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Update `tests/test_bracket.py` to add tests for `to_bracket_order()`.
 
 ```python
@@ -143,18 +143,18 @@ def test_to_bracket_order_two_targets():
     assert bo.target == TargetSpec(price=Decimal("344.82"))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `.venv/bin/python -m pytest tests/test_bracket.py -k test_to_bracket_order -v`
 Expected: FAIL with `ImportError: cannot import name 'to_bracket_order'`
 
-- [ ] **Step 3: Implement `to_bracket_order` in `companion/bracket.py`**
+- [x] **Step 3: Implement `to_bracket_order` in `companion/bracket.py`**
 Implement `to_bracket_order(p: Plan, exit_duration: str = "DAY") -> BracketOrder`.
 
-- [ ] **Step 4: Run tests to verify all bracket tests pass**
+- [x] **Step 4: Run tests to verify all bracket tests pass**
 Run: `.venv/bin/python -m pytest tests/test_bracket.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add companion/bracket.py tests/test_bracket.py
 git commit -m "feat(bracket): add to_bracket_order emitting normalized BracketOrder"
@@ -173,7 +173,7 @@ git commit -m "feat(bracket): add to_bracket_order emitting normalized BracketOr
 - Consumes: `BrokerBackend`, `BrokerCapabilities`, domain models from `companion.backends.base`. Existing logic from `companion/schwab.py`, `orders.py:pending_orders`, `pnl.py:fills_from_transactions`.
 - Produces: `SchwabBackend(BrokerBackend)`. Implements all methods of `BrokerBackend`. Translates `BracketOrder` to Schwab `TRIGGER` / `OCO` JSON trees. Handles HTTP 429 rate limits.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Create `tests/test_schwab_backend.py` to test payload translation and bracket JSON construction.
 
 ```python
@@ -214,18 +214,18 @@ def test_schwab_bracket_order_json_two_targets():
     assert len(payload["childOrderStrategies"]) == 2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `.venv/bin/python -m pytest tests/test_schwab_backend.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'companion.backends.schwab'`
 
-- [ ] **Step 3: Implement `companion/backends/schwab.py`**
+- [x] **Step 3: Implement `companion/backends/schwab.py`**
 Implement `SchwabBackend`, migrating `companion/schwab.py` code into it, adding payload translation methods, and registering `"schwab"` in `companion/backends/registry.py`.
 
-- [ ] **Step 4: Run tests to verify it passes**
+- [x] **Step 4: Run tests to verify it passes**
 Run: `.venv/bin/python -m pytest tests/test_schwab_backend.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add companion/backends/schwab.py companion/backends/registry.py tests/test_schwab_backend.py
 git commit -m "feat(backend): implement SchwabBackend with order and payload translation"
@@ -243,17 +243,17 @@ git commit -m "feat(backend): implement SchwabBackend with order and payload tra
 - Consumes: `backend: BrokerBackend`.
 - Produces: `Poller(backend: BrokerBackend, store: Store)` with all raw `schwabdev` calls replaced by `backend.get_positions()`, `backend.get_orders()`, `backend.get_fills()`, `backend.get_quotes()`, `backend.get_market_hours()`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Update `tests/test_auto_be.py` or create a unit test verifying `Poller` operates with a mock `BrokerBackend`.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `.venv/bin/python -m pytest tests/test_auto_be.py -v`
 Expected: Check failure or incompatibility with new `Poller(backend, store)` signature.
 
-- [ ] **Step 3: Refactor `companion/poller.py`**
+- [x] **Step 3: Refactor `companion/poller.py`**
 Inject `backend: BrokerBackend` into `Poller`. Replace direct client calls with `backend` method calls.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 Run: `.venv/bin/python -m pytest tests/test_auto_be.py -v`
 Expected: PASS
 
