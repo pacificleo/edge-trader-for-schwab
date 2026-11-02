@@ -21,7 +21,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
+from .backends import get_backend
 from .poller import Poller
+from .store import Store
 from .trading import Trader
 from .view import private_view
 
@@ -30,14 +32,24 @@ PORT = int(os.environ.get("COMPANION_PORT", "8770"))
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
 DEMO = os.environ.get("EDGE_TRADER_DEMO") == "1"     # synthetic data, no Schwab, no orders
 PRIVATE = os.environ.get("EDGE_TRADER_PRIVATE") == "1"   # hide carried positions and account value
+BROKER = os.environ.get("EDGE_TRADER_BROKER", "schwab").lower().strip()
+
+
+def resolve_db_path(broker: str = BROKER, demo: bool = DEMO) -> Path:
+    if demo:
+        return Path(__file__).resolve().parent.parent / "data" / "demo.db"
+    return Path(__file__).resolve().parent.parent / "data" / f"db_{broker.lower().strip()}.db"
+
+
+DB_PATH = resolve_db_path(BROKER, DEMO)
+store = Store(DB_PATH)
 
 
 class DemoPoller:
     """Stands in for the poller in demo mode: synthetic state, never touches Schwab."""
 
-    def __init__(self):
-        from .store import Store
-        self.store = Store(Path(__file__).resolve().parent.parent / "data" / "demo.db")
+    def __init__(self, store: Store | None = None):
+        self.store = store or Store(resolve_db_path(demo=True))
         self.terminal, self.orders_today, self.trader = set(), {}, None
 
     def snapshot(self) -> dict:
@@ -54,8 +66,14 @@ class DemoPoller:
     def cooldown_left(self): return 0.0
 
 
-poller = DemoPoller() if DEMO else Poller()
-trader = Trader(poller.store)
+if DEMO:
+    poller = DemoPoller(store)
+    trader = Trader(store=store)
+else:
+    backend = get_backend(BROKER, auto_connect=False)
+    poller = Poller(backend=backend, store=store)
+    trader = Trader(backend=backend, store=store)
+
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
@@ -132,6 +150,7 @@ def state():
     if PRIVATE:
         snap = private_view(snap)
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
+                         "broker": BROKER,
                          "version": __version__}, headers={"Cache-Control": "no-store"})
 
 

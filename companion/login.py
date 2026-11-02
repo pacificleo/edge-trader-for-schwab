@@ -2,6 +2,7 @@
 
     python -m companion.login            (or login.bat)
     python -m companion.login --reauth   (force a brand new sign-in)
+    python -m companion.login --broker alpaca
 
 Built on schwabdev by Tyler Bowers (https://github.com/tylerebowers/Schwabdev, MIT licence), which
 handles Schwab's OAuth sign-in and token refresh.
@@ -19,11 +20,7 @@ from datetime import datetime, timedelta
 from . import schwab
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Schwab sign-in for Edge Trader")
-    ap.add_argument("--reauth", action="store_true", help="force a new sign-in even if the token is still valid")
-    args = ap.parse_args()
-
+def login_schwab(reauth: bool = False) -> None:
     key = os.environ.get("SCHWAB_APP_KEY")
     secret = os.environ.get("SCHWAB_APP_SECRET")
     cb = os.environ.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1")
@@ -45,7 +42,7 @@ def main() -> None:
 
     import schwabdev
     client = schwabdev.Client(app_key=key, app_secret=secret, callback_url=cb, tokens_db=str(schwab.TOKENS_DB))
-    if args.reauth:
+    if reauth:
         client.tokens.update_tokens(force_refresh_token=True)
 
     try:
@@ -85,6 +82,17 @@ def main() -> None:
         print("  its Order Limit is above 0. With 0, every order is refused with HTTP 429.")
     else:
         sys.exit("  Something failed: check the keys in .env and that your app has the Trader API product.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Sign in for Edge Trader")
+    ap.add_argument("--broker", default="schwab", help="broker backend (default: schwab)")
+    ap.add_argument("--reauth", action="store_true", help="force a new sign-in even if the token is still valid")
+    args = ap.parse_args(argv)
+
+    from .backends import get_backend
+    backend = get_backend(args.broker)
+    backend.login_cli(reauth=args.reauth)
 
 
 if __name__ == "__main__":

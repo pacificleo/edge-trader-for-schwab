@@ -63,8 +63,9 @@ def _hash(obj) -> str:
 
 class Store:
     def __init__(self, path: Path = DB):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = sqlite3.connect(path, check_same_thread=False)
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._con = sqlite3.connect(self.path, check_same_thread=False)
         self._con.executescript(SCHEMA)
         self._lock = threading.Lock()
         self._last_positions_hash: str | None = None

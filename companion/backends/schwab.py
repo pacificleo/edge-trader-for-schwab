@@ -514,8 +514,8 @@ class SchwabBackend(BrokerBackend):
         return schwab.auth_hours_left()
 
     def login_cli(self, reauth: bool = False) -> None:
-        from .. import login
-        login.main()
+        from ..login import login_schwab
+        login_schwab(reauth=reauth)
 
     def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
         if not symbols or self.client is None:

@@ -35,7 +35,7 @@ from .backends import (
     get_backend,
 )
 from .bracket import MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick, to_bracket_order
-from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
+from .orders import LIVE, TERMINAL, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
 

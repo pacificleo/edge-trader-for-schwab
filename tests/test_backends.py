@@ -321,3 +321,95 @@ def test_registry_rejects_non_subclass():
 
     with pytest.raises(TypeError, match="must be a subclass of BrokerBackend"):
         register_backend("not_a_backend", NotABackend)  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# CLI & App Integration Tests (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_broker_arg_parsing_default(monkeypatch):
+    from companion.__main__ import parse_broker_arg
+
+    monkeypatch.delenv("EDGE_TRADER_BROKER", raising=False)
+    assert parse_broker_arg([]) == "schwab"
+
+
+def test_cli_broker_arg_parsing_flags(monkeypatch):
+    from companion.__main__ import parse_broker_arg
+
+    monkeypatch.delenv("EDGE_TRADER_BROKER", raising=False)
+    assert parse_broker_arg(["--broker", "alpaca"]) == "alpaca"
+    assert parse_broker_arg(["--broker=alpaca"]) == "alpaca"
+    assert parse_broker_arg(["--broker", " SCHWAB "]) == "schwab"
+    assert parse_broker_arg(["--broker=SCHWAB"]) == "schwab"
+
+
+def test_cli_broker_arg_parsing_env_fallback(monkeypatch):
+    from companion.__main__ import parse_broker_arg
+
+    monkeypatch.setenv("EDGE_TRADER_BROKER", "alpaca")
+    assert parse_broker_arg([]) == "alpaca"
+    # CLI flag overrides environment variable
+    assert parse_broker_arg(["--broker", "schwab"]) == "schwab"
+
+
+def test_resolve_db_path():
+    from companion.app import resolve_db_path
+
+    path_schwab = resolve_db_path("schwab", demo=False)
+    assert path_schwab.name == "db_schwab.db"
+
+    path_alpaca = resolve_db_path("alpaca", demo=False)
+    assert path_alpaca.name == "db_alpaca.db"
+
+    path_demo = resolve_db_path("schwab", demo=True)
+    assert path_demo.name == "demo.db"
+
+    path_demo_alpaca = resolve_db_path("alpaca", demo=True)
+    assert path_demo_alpaca.name == "demo.db"
+
+
+def test_api_state_reports_broker(monkeypatch):
+    from fastapi.testclient import TestClient
+    from companion.app import app
+
+    client = TestClient(app, base_url="http://127.0.0.1:8770")
+    resp = client.get("/api/state")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "broker" in data
+    assert data["broker"] == "schwab"
+
+    # Test dynamic broker setting in state
+    monkeypatch.setattr("companion.app.BROKER", "alpaca")
+    resp2 = client.get("/api/state")
+    assert resp2.status_code == 200
+    assert resp2.json()["broker"] == "alpaca"
+
+
+def test_login_cli_broker_arg(monkeypatch):
+    from companion import login
+
+    called = {}
+
+    class MockLoginBackend:
+        def login_cli(self, reauth: bool = False):
+            called["reauth"] = reauth
+
+    monkeypatch.setattr("companion.backends.get_backend", lambda name: MockLoginBackend())
+    login.main(["--broker", "schwab", "--reauth"])
+    assert called.get("reauth") is True
+
+
+def test_app_wires_backend_and_store():
+    import companion.app as app_mod
+
+    assert app_mod.store.path == app_mod.DB_PATH
+    if not app_mod.DEMO:
+        assert app_mod.poller.backend is not None
+        assert app_mod.trader.backend is not None
+        assert app_mod.poller.store is app_mod.store
+        assert app_mod.trader.store is app_mod.store
+
+
