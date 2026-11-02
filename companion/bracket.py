@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
+from .backends.base import BracketOrder, StopSpec, TargetSpec
+
 ENTRY_OFFSET = Decimal("0.0005")     # 0.05% through the ask / bid
 MAX_SHARES = 10_000
 MAX_NOTIONAL = Decimal("250000")
@@ -316,6 +318,39 @@ def _two_targets(p: Plan) -> None:
                 p.qty1, p.target1 = qty1, t1
                 return
     p.qty = 0
+
+
+def to_bracket_order(p: Plan, exit_duration: str = "DAY") -> BracketOrder:
+    """Convert a Plan to a normalized BrokerBackend BracketOrder."""
+    if not p.ok:
+        raise ValueError("cannot build an order from an invalid plan: " + "; ".join(p.errors))
+
+    if p.trail:
+        stop = StopSpec(
+            order_type="TRAILING_STOP",
+            trail_offset=p.trail["offset"],
+            trail_link=p.trail["link"],
+            trail_basis=p.trail["basis"],
+        )
+    else:
+        stop = StopSpec(order_type="STOP", price=p.stop)
+
+    target = TargetSpec(price=p.target)
+    qty1 = p.qty1 if p.two_targets else None
+    target1 = TargetSpec(price=p.target1) if p.two_targets else None
+
+    return BracketOrder(
+        symbol=p.symbol,
+        side=p.side,  # type: ignore[arg-type]
+        qty=p.qty,
+        entry_type="MARKET" if p.market else "LIMIT",
+        limit_price=None if p.market else p.limit,
+        stop=stop,
+        target=target,
+        qty1=qty1,
+        target1=target1,
+        duration=exit_duration,
+    )
 
 
 def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:

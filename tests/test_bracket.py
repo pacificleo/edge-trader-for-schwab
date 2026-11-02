@@ -1,6 +1,9 @@
 from decimal import Decimal
 
-from companion.bracket import bracket_order, plan
+import pytest
+
+from companion.backends.base import BracketOrder, StopSpec, TargetSpec
+from companion.bracket import bracket_order, plan, to_bracket_order
 
 
 def test_long_sizing_from_marketable_limit():
@@ -177,3 +180,65 @@ def test_trail_wider_than_the_stop_warns_and_percent_works():
     assert q.ok and q.trail["link"] == "PERCENT" and q.trail_start > q.limit
     assert not plan("TSX", "LONG", stop="414.73", risk=375, r_multiple=2, bid="417.80", ask="417.86",
                     stop_type="trail", trail_unit="$", trail_value=0).ok
+
+
+def test_to_bracket_order_single_target():
+    p = plan("AVGO", "LONG", stop="336.00", risk=500, r_multiple=2, bid="338.70", ask="338.77")
+    bo = to_bracket_order(p)
+    assert isinstance(bo, BracketOrder)
+    assert bo.symbol == "AVGO"
+    assert bo.side == "LONG"
+    assert bo.qty == 170
+    assert bo.entry_type == "LIMIT"
+    assert bo.limit_price == Decimal("338.94")
+    assert bo.stop == StopSpec(order_type="STOP", price=Decimal("336.00"))
+    assert bo.target == TargetSpec(price=Decimal("344.82"))
+    assert bo.qty1 is None
+    assert bo.target1 is None
+    assert bo.duration == "DAY"
+
+    bo_gtc = to_bracket_order(p, exit_duration="GTC")
+    assert bo_gtc.duration == "GTC"
+
+
+def test_to_bracket_order_two_targets():
+    p = plan("BRVO", "LONG", stop="336.00", risk=500, r_multiple=2, bid="338.70", ask="338.77", split=0.5, t1_r=1)
+    bo = to_bracket_order(p)
+    assert isinstance(bo, BracketOrder)
+    assert bo.symbol == "BRVO"
+    assert bo.side == "LONG"
+    assert bo.qty == 170
+    assert bo.entry_type == "LIMIT"
+    assert bo.limit_price == Decimal("338.94")
+    assert bo.stop == StopSpec(order_type="STOP", price=Decimal("336.00"))
+    assert bo.qty1 == 85
+    assert bo.target1 == TargetSpec(price=Decimal("341.88"))
+    assert bo.target == TargetSpec(price=Decimal("344.82"))
+
+
+def test_to_bracket_order_trailing_stop():
+    p = plan("TSX", "LONG", stop="414.73", risk=375, r_multiple=2, bid="417.80", ask="417.86", entry="mid",
+             stop_type="trail", trail_unit="%", trail_value=0.5)
+    bo = to_bracket_order(p)
+    assert isinstance(bo, BracketOrder)
+    assert bo.stop == StopSpec(
+        order_type="TRAILING_STOP",
+        trail_offset=p.trail["offset"],
+        trail_link="PERCENT",
+        trail_basis="MARK",
+    )
+
+
+def test_to_bracket_order_market_entry():
+    p = plan("BRVO", "LONG", stop="336.00", risk=500, r_multiple=2, bid="338.70", ask="338.80", entry="market")
+    bo = to_bracket_order(p)
+    assert isinstance(bo, BracketOrder)
+    assert bo.entry_type == "MARKET"
+    assert bo.limit_price is None
+
+
+def test_to_bracket_order_invalid_plan_raises():
+    p = plan("BRVO", "LONG", stop="339.00", risk=500, r_multiple=2, bid="338.70", ask="338.77")
+    assert not p.ok
+    with pytest.raises(ValueError, match="cannot build an order from an invalid plan"):
+        to_bracket_order(p)
